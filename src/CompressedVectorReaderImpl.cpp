@@ -161,6 +161,9 @@ namespace e57
                   dpkt->getBytestreamBufferLength( channel.bytestreamNumber );
             }
          }
+
+         currentDataPacketLogicalOffset_ = dataLogicalOffset;
+         currentChunkFirstRecord_ = 0;
       }
 
       // Just before return (and can't throw) increment reader count  ??? safer
@@ -220,6 +223,17 @@ namespace e57
       }
 
       dbufs_ = dbufs;
+
+      if ( channels_.size() == dbufs_.size() )
+      {
+         for ( size_t i = 0; i < channels_.size(); i++ )
+         {
+            channels_[i].dbuf = dbufs_[i];
+            std::vector<SourceDestBuffer> theDbuf;
+            theDbuf.push_back( dbufs_[i] );
+            channels_[i].decoder->destBufferSetNew( theDbuf );
+         }
+      }
    }
 
    unsigned CompressedVectorReaderImpl::read( std::vector<SourceDestBuffer> &dbufs )
@@ -295,6 +309,9 @@ namespace e57
             }
          }
       }
+
+      // Update record count
+      recordCount_ += outputCount;
 
       // Return number of records transferred to each dbuf.
       return outputCount;
@@ -542,12 +559,321 @@ namespace e57
       return UINT64_MAX;
    }
 
-   void CompressedVectorReaderImpl::seek( uint64_t /*recordNumber*/ )
+   void CompressedVectorReaderImpl::seek( uint64_t recordNumber )
    {
       checkImageFileOpen( __FILE__, __LINE__, static_cast<const char *>( __FUNCTION__ ) );
+      checkReaderOpen( __FILE__, __LINE__, static_cast<const char *>( __FUNCTION__ ) );
 
-      // !!! implement
-      throw E57_EXCEPTION1( ErrorNotImplemented );
+      // Validate record number
+      if ( recordNumber > maxRecordCount_ )
+      {
+         throw E57_EXCEPTION2( ErrorSeekFailed,
+                               "recordNumber=" + toString( recordNumber ) +
+                                  " exceeds maxRecordCount=" + toString( maxRecordCount_ ) );
+      }
+
+      // If seeking to current position or beginning, just reset decoders
+      if ( recordNumber == currentChunkFirstRecord_ )
+      {
+         // Reset decoders to beginning of current chunk
+         for ( auto &channel : channels_ )
+         {
+            channel.decoder->stateReset();
+            channel.currentBytestreamBufferIndex = 0;
+            channel.currentPacketLogicalOffset = currentDataPacketLogicalOffset_;
+         }
+         recordCount_ = currentChunkFirstRecord_;
+         return;
+      }
+
+      // Find the chunk containing targetRecordNumber using index packets
+      uint64_t chunkPhysicalOffset = 0;
+      uint64_t chunkFirstRecord = findChunkForRecord( recordNumber, chunkPhysicalOffset );
+
+      // Seek to the found chunk
+      seekToChunk( chunkPhysicalOffset, chunkFirstRecord );
+
+      if ( recordNumber > chunkFirstRecord )
+      {
+         skipRecords( recordNumber - chunkFirstRecord );
+      }
+   }
+
+   uint64_t CompressedVectorReaderImpl::findChunkForRecord( uint64_t targetRecordNumber,
+                                                            uint64_t &outChunkPhysicalOffset )
+   {
+#ifdef E57_VERBOSE
+      std::cout << "findChunkForRecord: targetRecordNumber=" << targetRecordNumber << std::endl;
+#endif
+
+      ImageFileImplSharedPtr imf( cVector_->destImageFile_ );
+
+      // Get section header to find index packet location
+      uint64_t sectionLogicalStart = cVector_->getBinarySectionLogicalStart();
+      CompressedVectorSectionHeader sectionHeader;
+      imf->file_->seek( sectionLogicalStart, CheckedFile::Logical );
+      imf->file_->read( reinterpret_cast<char *>( &sectionHeader ), sizeof( sectionHeader ) );
+
+      // Check if index packets exist
+      if ( sectionHeader.indexPhysicalOffset == 0 )
+      {
+         // No index packets, start from first data packet
+         outChunkPhysicalOffset = sectionHeader.dataPhysicalOffset;
+         return 0;
+      }
+
+      // Convert physical offset of first index packet to logical
+      uint64_t indexLogicalOffset =
+         imf->file_->physicalToLogical( sectionHeader.indexPhysicalOffset );
+
+      // Read and search through index packets. Index entries are ordered by
+      // record number. Keep the last entry whose first record is <= target.
+      uint64_t currentIndexLogicalOffset = indexLogicalOffset;
+      uint64_t sectionEndLogicalOffset = sectionLogicalStart + sectionHeader.sectionLogicalLength;
+      bool foundCandidate = false;
+      IndexPacket::Entry candidate;
+
+      while ( currentIndexLogicalOffset < sectionEndLogicalOffset )
+      {
+         char *indexPacketBuffer = nullptr;
+         std::unique_ptr<PacketLock> packetLock =
+            cache_->lock( currentIndexLogicalOffset, indexPacketBuffer );
+
+         auto ipkt = reinterpret_cast<const IndexPacket *>( indexPacketBuffer );
+
+         // Check packet type
+         if ( ipkt->header.packetType != INDEX_PACKET )
+         {
+            // Move to next packet
+            currentIndexLogicalOffset += ipkt->header.packetLogicalLengthMinus1 + 1;
+            continue;
+         }
+
+#ifdef E57_VERBOSE
+         std::cout << "  Index packet has " << ipkt->header.entryCount << " entries" << std::endl;
+#endif
+
+         // Search through index entries for the target record
+         for ( unsigned i = 0; i < ipkt->header.entryCount; i++ )
+         {
+            const auto &entry = ipkt->entries[i];
+
+#ifdef E57_VERBOSE
+            std::cout << "    Entry " << i << ": chunkRecordNumber=" << entry.chunkRecordNumber
+                      << std::endl;
+#endif
+
+            if ( entry.chunkRecordNumber > targetRecordNumber )
+            {
+               outChunkPhysicalOffset = candidate.chunkPhysicalOffset;
+               return candidate.chunkRecordNumber;
+            }
+
+            candidate = entry;
+            foundCandidate = true;
+         }
+
+         // Move to next index packet
+         currentIndexLogicalOffset += ipkt->header.packetLogicalLengthMinus1 + 1;
+      }
+
+      if ( foundCandidate )
+      {
+         outChunkPhysicalOffset = candidate.chunkPhysicalOffset;
+         return candidate.chunkRecordNumber;
+      }
+
+      // Target record precedes the first indexed chunk, start from beginning.
+      outChunkPhysicalOffset = sectionHeader.dataPhysicalOffset;
+      return 0;
+   }
+
+   void CompressedVectorReaderImpl::seekToChunk( uint64_t chunkPhysicalOffset,
+                                                 uint64_t firstRecordInChunk )
+   {
+#ifdef E57_VERBOSE
+      std::cout << "seekToChunk: chunkPhysicalOffset=" << chunkPhysicalOffset
+                << " firstRecordInChunk=" << firstRecordInChunk << std::endl;
+#endif
+
+      ImageFileImplSharedPtr imf( cVector_->destImageFile_ );
+
+      // Convert physical offset to logical
+      uint64_t chunkLogicalOffset =
+         imf->file_->physicalToLogical( chunkPhysicalOffset );
+
+      // Verify it's a data packet
+      char *anyPacket = nullptr;
+      std::unique_ptr<PacketLock> packetLock = cache_->lock( chunkLogicalOffset, anyPacket );
+
+      auto dpkt = reinterpret_cast<DataPacket *>( anyPacket );
+
+      if ( dpkt->header.packetType != DATA_PACKET )
+      {
+         throw E57_EXCEPTION2( ErrorBadCVPacket,
+                               "packetType=" + toString( dpkt->header.packetType ) );
+      }
+
+      // Reset all channels to read from this packet
+      for ( auto &channel : channels_ )
+      {
+         channel.decoder->stateReset();
+         channel.currentPacketLogicalOffset = chunkLogicalOffset;
+         channel.currentBytestreamBufferIndex = 0;
+         channel.currentBytestreamBufferLength =
+            dpkt->getBytestreamBufferLength( channel.bytestreamNumber );
+         channel.inputFinished = false;
+      }
+
+      // Update reader state
+      recordCount_ = firstRecordInChunk;
+      currentDataPacketLogicalOffset_ = chunkLogicalOffset;
+      currentChunkFirstRecord_ = firstRecordInChunk;
+
+#ifdef E57_VERBOSE
+      std::cout << "seekToChunk: positioned at record " << recordCount_ << std::endl;
+#endif
+   }
+
+   void CompressedVectorReaderImpl::skipRecords( uint64_t recordsToSkip )
+   {
+      if ( recordsToSkip == 0 )
+      {
+         return;
+      }
+
+      std::vector<SourceDestBuffer> originalDbufs = dbufs_;
+      std::vector<SourceDestBuffer> scratchDbufs;
+      scratchDbufs.reserve( originalDbufs.size() );
+
+      std::vector<std::vector<int8_t>> int8Buffers;
+      std::vector<std::vector<uint8_t>> uint8Buffers;
+      std::vector<std::vector<int16_t>> int16Buffers;
+      std::vector<std::vector<uint16_t>> uint16Buffers;
+      std::vector<std::vector<int32_t>> int32Buffers;
+      std::vector<std::vector<uint32_t>> uint32Buffers;
+      std::vector<std::vector<int64_t>> int64Buffers;
+      std::vector<std::unique_ptr<bool[]>> boolBuffers;
+      std::vector<std::vector<float>> floatBuffers;
+      std::vector<std::vector<double>> doubleBuffers;
+      std::vector<std::vector<ustring>> stringBuffers;
+
+      int8Buffers.reserve( originalDbufs.size() );
+      uint8Buffers.reserve( originalDbufs.size() );
+      int16Buffers.reserve( originalDbufs.size() );
+      uint16Buffers.reserve( originalDbufs.size() );
+      int32Buffers.reserve( originalDbufs.size() );
+      uint32Buffers.reserve( originalDbufs.size() );
+      int64Buffers.reserve( originalDbufs.size() );
+      boolBuffers.reserve( originalDbufs.size() );
+      floatBuffers.reserve( originalDbufs.size() );
+      doubleBuffers.reserve( originalDbufs.size() );
+      stringBuffers.reserve( originalDbufs.size() );
+
+      const size_t scratchCapacity = static_cast<size_t>(
+         std::min<uint64_t>( originalDbufs.front().capacity(), recordsToSkip ) );
+      ImageFile scratchImageFile( ImageFileImplSharedPtr( cVector_->destImageFile_ ) );
+      for ( const auto &dbuf : originalDbufs )
+      {
+         switch ( dbuf.memoryRepresentation() )
+         {
+            case Int8:
+               int8Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          int8Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case UInt8:
+               uint8Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          uint8Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Int16:
+               int16Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          int16Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case UInt16:
+               uint16Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          uint16Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Int32:
+               int32Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          int32Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case UInt32:
+               uint32Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          uint32Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Int64:
+               int64Buffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          int64Buffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Bool:
+               boolBuffers.emplace_back( new bool[scratchCapacity] );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          boolBuffers.back().get(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Real32:
+               floatBuffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          floatBuffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case Real64:
+               doubleBuffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          doubleBuffers.back().data(), scratchCapacity,
+                                          dbuf.doConversion(), dbuf.doScaling() );
+               break;
+
+            case UString:
+               stringBuffers.emplace_back( scratchCapacity );
+               scratchDbufs.emplace_back( scratchImageFile, dbuf.pathName(),
+                                          &stringBuffers.back() );
+               break;
+
+            default:
+               throw E57_EXCEPTION1( ErrorInternal );
+         }
+      }
+
+      setBuffers( scratchDbufs );
+
+      while ( recordsToSkip > 0 )
+      {
+         const unsigned skipped = read();
+         if ( skipped == 0 || skipped > recordsToSkip )
+         {
+            throw E57_EXCEPTION2( ErrorSeekFailed,
+                                  "recordsToSkip=" + toString( recordsToSkip ) +
+                                     " skipped=" + toString( skipped ) );
+         }
+
+         recordsToSkip -= skipped;
+      }
+
+      setBuffers( originalDbufs );
    }
 
    bool CompressedVectorReaderImpl::isOpen() const
@@ -636,4 +962,4 @@ namespace e57
    }
 #endif
 
-}
+}  // namespace e57

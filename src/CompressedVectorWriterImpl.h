@@ -75,7 +75,9 @@ namespace e57
       uint64_t dataPhysicalOffset_;        /// start of first data packet
       uint64_t topIndexPhysicalOffset_;    /// top level index packet
       uint64_t recordCount_;               /// number of records written so far
+      uint64_t nextDataPacketRecordNumber_; /// first record in the next data packet
       uint64_t dataPacketsCount_;          /// number of data packets written so far
       uint64_t indexPacketsCount_;         /// number of index packets written so far
+      std::vector<IndexPacket::Entry> indexEntries_; ///< entries used to build index packets
    };
 }

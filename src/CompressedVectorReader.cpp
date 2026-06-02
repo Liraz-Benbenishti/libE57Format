@@ -272,7 +272,12 @@ childCount() (i.e. to one record past end of CompressedVectorNode).
 */
 void CompressedVectorReader::seek( int64_t recordNumber )
 {
-   impl_->seek( recordNumber );
+   if ( recordNumber < 0 )
+   {
+      throw E57_EXCEPTION2( ErrorBadAPIArgument, 
+                            "recordNumber must be >= 0" );
+   }
+   impl_->seek( static_cast<uint64_t>( recordNumber ) );
 }
 
 /*!

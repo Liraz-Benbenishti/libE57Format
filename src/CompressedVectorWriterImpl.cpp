@@ -120,6 +120,7 @@ namespace e57
       dataPhysicalOffset_ = 0;
       topIndexPhysicalOffset_ = 0;
       recordCount_ = 0;
+      nextDataPacketRecordNumber_ = 0;
       dataPacketsCount_ = 0;
       indexPacketsCount_ = 0;
 
@@ -608,9 +609,23 @@ namespace e57
       {
          dataPhysicalOffset_ = packetPhysicalOffset;
       }
-      dataPacketsCount_++;
 
-      // !!! update seekIndex here? if started new chunk?
+      IndexPacket::Entry entry;
+      entry.chunkRecordNumber = nextDataPacketRecordNumber_;
+      entry.chunkPhysicalOffset = packetPhysicalOffset;
+      indexEntries_.push_back( entry );
+
+      if ( !bytestreams_.empty() )
+      {
+         nextDataPacketRecordNumber_ = bytestreams_.front()->currentRecordIndex();
+         for ( const auto &bytestream : bytestreams_ )
+         {
+            nextDataPacketRecordNumber_ =
+               std::min( nextDataPacketRecordNumber_, bytestream->currentRecordIndex() );
+         }
+      }
+
+      dataPacketsCount_++;
 
       // Return physical offset of data packet for potential use in seekIndex
       return ( packetPhysicalOffset ); //??? needed
@@ -668,22 +683,40 @@ namespace e57
    {
       ImageFileImplSharedPtr imf( cVector_->destImageFile_ );
 
-      IndexPacket indexPacket;
+      if ( indexEntries_.empty() )
+      {
+         return;
+      }
 
-      indexPacket.entries[0].chunkPhysicalOffset = dataPhysicalOffset_;
+      const size_t cMaxEntries = IndexPacket::MAX_ENTRIES;
+      for ( size_t start = 0; start < indexEntries_.size(); start += cMaxEntries )
+      {
+         IndexPacket indexPacket;
+         size_t entriesToWrite = std::min( cMaxEntries, indexEntries_.size() - start );
 
-      const auto cPacketLength = sizeof( IndexPacketHeader ) + sizeof( IndexPacket::Entry );
+         for ( size_t i = 0; i < entriesToWrite; ++i )
+         {
+            indexPacket.entries[i] = indexEntries_[start + i];
+         }
 
-      indexPacket.header.packetLogicalLengthMinus1 = cPacketLength - 1;
-      indexPacket.header.entryCount = 1;
+         const auto cPacketLength = sizeof( IndexPacketHeader ) +
+            static_cast<unsigned>( entriesToWrite * sizeof( IndexPacket::Entry ) );
 
-      uint64_t packetLogicalOffset = imf->allocateSpace( cPacketLength, false );
-      topIndexPhysicalOffset_ = imf->file_->logicalToPhysical( packetLogicalOffset );
+         indexPacket.header.packetLogicalLengthMinus1 = cPacketLength - 1;
+         indexPacket.header.entryCount = static_cast<unsigned>( entriesToWrite );
+         indexPacket.header.indexLevel = 0;
 
-      imf->file_->seek( packetLogicalOffset );
-      imf->file_->write( reinterpret_cast<const char *>( &indexPacket ), cPacketLength );
+         uint64_t packetLogicalOffset = imf->allocateSpace( cPacketLength, false );
+         if ( start == 0 )
+         {
+            topIndexPhysicalOffset_ = imf->file_->logicalToPhysical( packetLogicalOffset );
+         }
 
-      indexPacketsCount_++;
+         imf->file_->seek( packetLogicalOffset );
+         imf->file_->write( reinterpret_cast<const char *>( &indexPacket ), cPacketLength );
+
+         indexPacketsCount_++;
+      }
    }
 
    void CompressedVectorWriterImpl::flush()

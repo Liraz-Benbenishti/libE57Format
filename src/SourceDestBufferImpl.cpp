@@ -983,12 +983,6 @@ void SourceDestBufferImpl::checkCompatible(
                             "memoryRepresentation=" + toString( memoryRepresentation_ ) +
                                " newMemoryType=" + toString( newBuf->memoryRepresentation() ) );
    }
-   if ( capacity_ != newBuf->capacity() )
-   {
-      throw E57_EXCEPTION2( ErrorBuffersNotCompatible,
-                            "capacity=" + toString( capacity_ ) +
-                               " newCapacity=" + toString( newBuf->capacity() ) );
-   }
    if ( doConversion_ != newBuf->doConversion() )
    {
       throw E57_EXCEPTION2( ErrorBuffersNotCompatible,

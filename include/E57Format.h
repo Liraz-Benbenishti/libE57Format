@@ -426,7 +426,7 @@ public:                                                                         
 
       unsigned read();
       unsigned read( std::vector<SourceDestBuffer> &dbufs );
-      void seek( int64_t recordNumber ); // !!! not implemented yet
+      void seek( int64_t recordNumber );
       void close();
       bool isOpen();
       CompressedVectorNode compressedVectorNode() const;
@@ -778,6 +778,7 @@ public:                                                                         
       friend class FloatNode;
       friend class StringNode;
       friend class BlobNode;
+      friend class CompressedVectorReaderImpl;
 
       explicit ImageFile( std::shared_ptr<ImageFileImpl> imfi );
 

@@ -62,6 +62,9 @@ namespace e57
       DataPacket *dataPacket( uint64_t inLogicalOffset ) const;
       void feedPacketToDecoders( uint64_t currentPacketLogicalOffset );
       uint64_t findNextDataPacket( uint64_t nextPacketLogicalOffset );
+      uint64_t findChunkForRecord( uint64_t targetRecordNumber, uint64_t &outChunkPhysicalOffset );
+      void seekToChunk( uint64_t chunkPhysicalOffset, uint64_t firstRecordInChunk );
+      void skipRecords( uint64_t recordCount );
 
       //??? no default ctor, copy, assignment?
 
@@ -72,8 +75,10 @@ namespace e57
       std::vector<DecodeChannel> channels_;
       PacketReadCache *cache_;
 
-      uint64_t recordCount_; /// number of records written so far
+      uint64_t recordCount_; /// number of records decoded so far
       uint64_t maxRecordCount_;
       uint64_t sectionEndLogicalOffset_;
+      uint64_t currentDataPacketLogicalOffset_; /// current packet being read
+      uint64_t currentChunkFirstRecord_; /// first record number in current chunk
    };
 }
